@@ -1,0 +1,15 @@
+# Build products
+/build/
+/framescan
+*.o
+
+# Output
+/out/
+/render/
+
+# Source scans: large, and yours, not the project's.
+# Remove this line if you ever want to track a small test scan.
+/scans/
+
+# Legacy OpenCV prototype, superseded by the C tool. Kept on disk only.
+frame.py
