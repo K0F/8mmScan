@@ -8,25 +8,32 @@ PNG_CFLAGS  := $(shell pkg-config --cflags libpng 2>/dev/null)
 PNG_LIBS    := $(shell pkg-config --libs   libpng 2>/dev/null || echo -lpng)
 MATH_LIBS   := $(shell pkg-config --libs   zlib 2>/dev/null || echo -lz)
 
-BIN     := framescan
+BIN     := framescan mm8scan
 BUILD   := build
 OBJS    := $(BUILD)/framescan.o $(BUILD)/filmfind.o $(BUILD)/pngwrite.o
+MM8OBJS := $(BUILD)/mm8scan.o $(BUILD)/sprocketfind.o $(BUILD)/stabilize.o $(BUILD)/pngwrite.o $(BUILD)/filmfind.o
 
 SCANS     ?= scans
 OUT       ?= out
 FPS       ?= 18
 # Frames come out of framescan rotated 90 deg clockwise, so they are portrait:
 # the width is the frame's height along the strip, the height the frame width.
-RENDER_W  ?= 936
-RENDER_H  ?= 716
+# Every frame framescan emits is exactly the same size, so the render must not
+# touch the size at all: scaling each frame to a fixed canvas is what made the
+# film appear to jump when the crop size drifted. The scale filter below only
+# exists to force even dimensions for yuv420p, and the crops already are.
+RENDER_FILTER ?= setsar=1,scale=trunc(iw/2)*2:trunc(ih/2)*2
 MP4       ?= $(OUT)/frames.mp4
 
-.PHONY: all test unit e2e clean frames render
+.PHONY: all test unit e2e clean frames render mm8frames mm8render
 
 all: $(BIN)
 
-$(BIN): $(OBJS)
+framescan: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(JPEG_LIBS) $(PNG_LIBS) $(MATH_LIBS) -lm
+
+mm8scan: $(MM8OBJS)
+	$(CC) $(CFLAGS) -o $@ $(MM8OBJS) $(JPEG_LIBS) $(PNG_LIBS) $(MATH_LIBS) -lm
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(JPEG_CFLAGS) $(PNG_CFLAGS) -c -o $@ $<
@@ -58,17 +65,30 @@ test: unit e2e
 frames: all
 	./$(BIN) -o $(OUT) $(SCANS)
 
+## Extract 8mm frames with stabilization into $(OUT)/render
+mm8frames: mm8scan
+	./mm8scan -o $(OUT) $(SCANS)
+
 ## Extract frames and mux them into $(MP4) at $(FPS) fps
 render: frames
 	@command -v ffmpeg >/dev/null 2>&1 || { \
-	  echo "ffmpeg not found in PATH; install it to build $(MP4)"; exit 1; }
+	  echo "ffmpeg not found in PATH; install it to build $(MP4); exit 1; }
 	ffmpeg -hide_banner -loglevel error -y \
 	  -framerate $(FPS) -i $(OUT)/render/frame_%04d.png \
-	  -vf "scale=$(RENDER_W):$(RENDER_H):force_original_aspect_ratio=decrease,\
-pad=$(RENDER_W):$(RENDER_H):(ow-iw)/2:(oh-ih)/2,setsar=1" \
+	  -vf "$(RENDER_FILTER)" \
 	  -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p -r $(FPS) \
 	  -movflags +faststart $(MP4)
 	@echo "rendered $(MP4) at $(FPS) fps"
+
+mm8render: mm8frames
+	@command -v ffmpeg >/dev/null 2>&1 || { \
+	  echo "ffmpeg not found in PATH; install it to build $(MP4); exit 1; }
+	ffmpeg -hide_banner -loglevel error -y \
+	  -framerate $(FPS) -i $(OUT)/render/frame_%04d.png \
+	  -vf "$(RENDER_FILTER)" \
+	  -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p -r $(FPS) \
+	  -movflags +faststart $(MP4)
+	@echo "rendered stabilized $(MP4) at $(FPS) fps"
 
 clean:
 	rm -rf $(BUILD) $(BIN)

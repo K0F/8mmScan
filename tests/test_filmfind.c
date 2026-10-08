@@ -99,6 +99,8 @@ static unsigned char two_bands(int y, int x)
     return 5;
 }
 
+/* Here the film band is the modal region of the raster, so a global-mode
+ * background picks the wrong thing; the edge-row mode has to rescue it. */
 static void test_band_picks_tallest(void)
 {
     int w = 800, h = 1000;
@@ -128,16 +130,27 @@ static unsigned char *three_frames(int w, int h, int y0, int bh, int pitch,
 {
     unsigned char *g = fx_raster(w, h, y0, bh, pitch, (w + pitch - 1) / pitch, 0, -1, 0);
     *fw_out = pitch;
-    *fh_out = (int) (FF_HEIGHT_MM * bh / FF_FILM_MM + 0.5);
-    *fy_out = y0 + (int) (FF_TOP_MM * bh / FF_FILM_MM + 0.5);
+    *fh_out = (int) (FF_HEIGHT_MM * pitch / FF_FRAME_MM + 0.5);
+    *fy_out = y0 + (int) (FF_TOP_MM * pitch / FF_FRAME_MM + 0.5);
     return g;
 }
 
-#define T_W 1200
-#define T_H 1100
-#define T_Y0 150
-#define T_BH 770
+/* The fixture is self-consistent with the film model: a 735px strip over 35mm
+ * is 21.0 px/mm, and 21.0 * 19.05 = 400.05, so the frame pitch really is
+ * T_PITCH. The old T_BH of 770 was not, which only showed up once the geometry
+ * stopped being derived from the strip height. */
+#define T_W    1200
+#define T_H    1100
+#define T_Y0   150
+#define T_BH   735
 #define T_PITCH 400
+
+static void geom_for(ff_geometry *g, double pitch)
+{
+    ff_geometry_defaults(g);
+    g->pitch = pitch;
+    ff_geometry_finish(g, FF_HEIGHT_MM);
+}
 
 static void test_pitch(void)
 {
@@ -151,7 +164,7 @@ static void test_pitch(void)
     printf("  pitch: autocorrelation\n");
 }
 
-static void set_strip(ff_result *r, int x0, int y0, int x1, int y1, double pitch)
+static void set_strip(ff_result *r, int x0, int y0, int x1, int y1)
 {
     memset(r, 0, sizeof *r);
     r->strip.x0 = x0;
@@ -160,7 +173,6 @@ static void set_strip(ff_result *r, int x0, int y0, int x1, int y1, double pitch
     r->strip.y1 = y1;
     r->strip.w = x1 - x0 + 1;
     r->strip.h = y1 - y0 + 1;
-    r->pitch = pitch;
 }
 
 static void test_frames(void)
@@ -169,100 +181,101 @@ static void test_frames(void)
     int w = T_W, h = T_H;
     unsigned char *g = three_frames(w, h, y0, bh, pitch, &fw, &fh, &fy);
     ff_result r;
+    ff_geometry geo;
     int n;
 
-    set_strip(&r, 0, y0, w - 1, y0 + bh - 1, (double) pitch);
-    n = ff_build_frames(&r, w, h, 0.0, 0.0, FF_FILM_MM, FF_TOP_MM,
-                        FF_HEIGHT_MM, 0);
+    geom_for(&geo, (double) pitch);
+
+    set_strip(&r, 0, y0, w - 1, y0 + bh - 1);
+    n = ff_build_frames(&r, w, h, &geo, fy, 0.0, FF_FILM_MM, 0);
     ok(n == 3, "three whole frames fit");
-    ok(r.frames[0].x0 == 0, "first frame at strip left edge");
+    ok(r.frames[0].x0 == 0, "first frame at x=0");
     ok(r.frames[1].x0 == T_PITCH, "second frame at x=pitch");
     ok(r.frames[2].x0 == 2 * T_PITCH, "third frame at x=2*pitch");
-    ok(r.frames[0].w == T_PITCH,
-       "crop width equals pitch (frames butt together)");
-    ok(r.frames[0].h == fh, "crop height from mm geometry");
-    ok(r.frames[0].y0 == fy, "crop top from mm geometry");
-    near(r.px_per_mm, (double) bh / FF_FILM_MM, 1e-9, "px_per_mm");
+    ok(r.frames[0].w == geo.out_w,
+       "crop width comes from the global geometry, not this scan");
+    ok(r.frames[0].h == geo.out_h, "crop height comes from the global geometry");
+    ok(r.frames[0].y0 == fy, "crop top is the image-area top");
+    near(r.px_per_mm, (double) pitch / FF_FRAME_MM, 1e-9, "px_per_mm");
 
-    /* A strip that does not start at x=0 shifts the whole grid. The raster is
-     * widened so the offset strip still has room for three whole frames. */
-    set_strip(&r, 137, y0, 137 + 1199, y0 + bh - 1, (double) pitch);
-    n = ff_build_frames(&r, 1400, h, 0.0, 0.0, FF_FILM_MM, FF_TOP_MM,
-                        FF_HEIGHT_MM, 0);
-    ok(n == 3, "offset strip still yields three frames");
-    ok(r.frames[0].x0 == 137, "grid anchored to strip left edge");
-
-    /* Phase shifts the grid on top of the strip origin. */
-    set_strip(&r, 0, y0, w - 1, y0 + bh - 1, (double) pitch);
-    n = ff_build_frames(&r, w, h, 0.0, 40.0, FF_FILM_MM, FF_TOP_MM,
-                        FF_HEIGHT_MM, 0);
+    /* Phase shifts the grid on top of x=0. */
+    set_strip(&r, 0, y0, w - 1, y0 + bh - 1);
+    n = ff_build_frames(&r, w, h, &geo, fy, 40.0, FF_FILM_MM, 0);
     ok(n == 2, "phase 40 drops the clipped third frame");
     ok(r.frames[0].x0 == 40, "phase honoured");
 
     /* Partial frames are opt-in and get clamped. */
-    set_strip(&r, 0, y0, w - 1, y0 + bh - 1, (double) pitch);
-    n = ff_build_frames(&r, w, h, 0.0, 40.0, FF_FILM_MM, FF_TOP_MM,
-                        FF_HEIGHT_MM, 1);
+    set_strip(&r, 0, y0, w - 1, y0 + bh - 1);
+    n = ff_build_frames(&r, w, h, &geo, fy, 40.0, FF_FILM_MM, 1);
     ok(n == 3, "partial mode keeps the trailing frame");
-    ok(r.frames[2].x0 == 840 && r.frames[2].w == 360,
+    ok(r.frames[2].x0 == 840 && r.frames[2].w == w - 840,
        "trailing frame clamped to raster width");
 
     free(g);
     printf("  frames: grid layout\n");
 }
 
-/* The autocorrelation estimate carries a couple of percent of jitter. On a
- * 5728px-wide scan that is the difference between 7 and 8 frames, so the grid
- * must be snapped to the strip width rather than trusting the raw estimate. */
-static void test_frames_snap_to_strip(void)
+/* The whole point of the geometry pass: whatever the individual strip heights
+ * are, every frame comes out at the same size. */
+static void test_frames_uniform_size(void)
 {
-    static const double est[] = { 703.8, 709.1, 716.0, 718.9, 722.5 };
     ff_result r;
-    size_t i;
+    ff_geometry geo;
+    int n, i;
+    static const double strips[] = { 1255, 1294, 1322, 1350, 1409 };
 
-    for (i = 0; i < sizeof est / sizeof est[0]; i++) {
-        int n;
-        set_strip(&r, 0, 2026, 5727, 2026 + 1375, est[i]);
-        n = ff_build_frames(&r, 5728, 3824, 0.0, 0.0, FF_FILM_MM, FF_TOP_MM,
-                            FF_HEIGHT_MM, 0);
-        checks++;
-        if (n != 8) {
-            failures++;
-            printf("    FAIL pitch %.1f gave %d frames, want 8\n", est[i], n);
-            continue;
-        }
-        near(r.pitch, 5728.0 / 8.0, 1e-6, "snapped pitch");
-        ok(r.frames[0].x0 == 0 && r.frames[7].x0 + r.frames[7].w == 5728,
-           "8 frames tile the strip exactly");
+    geom_for(&geo, 704.74);
+    ok(geo.out_w == 704 && geo.out_h == 876, "real-roll output is 704x876");
+
+    for (i = 0; i < (int) (sizeof strips / sizeof strips[0]); i++) {
+        int bh = strips[i];
+        int img_top = 100 + (int) (FF_TOP_MM * geo.px_per_mm + 0.5);
+        set_strip(&r, 0, 100, 5727, 100 + bh - 1);
+        n = ff_build_frames(&r, 5728, 3824, &geo, img_top, 0.0, FF_FILM_MM, 0);
+        ok(n > 0, "frames found");
+        ok(r.frames[0].w == 704 && r.frames[0].h == 876,
+           "frame size independent of this scan's strip height");
     }
-    printf("  frames: snaps to strip width\n");
+    printf("  frames: one size for every scan\n");
 }
 
-/* An explicit --pitch must be respected verbatim, not re-snapped. */
-static void test_frames_manual_pitch(void)
+/* yuv420p needs both output dimensions even. */
+static void test_geometry_even(void)
 {
-    ff_result r;
-    int n;
-    set_strip(&r, 0, 2026, 5727, 2026 + 1375, 719.0);
-    n = ff_build_frames(&r, 5728, 3824, 715.0, 0.0, FF_FILM_MM, FF_TOP_MM,
-                        FF_HEIGHT_MM, 0);
-    ok(n == 8, "manual pitch yields eight frames");
-    near(r.pitch, 715.0, 1e-9, "manual pitch not re-snapped");
-    printf("  frames: manual pitch respected\n");
+    static const double pitches[] = { 703.9, 704.74, 705.3, 716.0, 719.1,
+                                      927.0, 936.5 };
+    size_t i;
+    for (i = 0; i < sizeof pitches / sizeof pitches[0]; i++) {
+        ff_geometry geo;
+        geom_for(&geo, pitches[i]);
+        checks++;
+        if (geo.out_w % 2 || geo.out_h % 2) {
+            failures++;
+            printf("    FAIL pitch %.2f gave odd output %dx%d\n",
+                   pitches[i], geo.out_w, geo.out_h);
+        }
+    }
+    printf("  geometry: output dimensions always even\n");
 }
 
 static void test_frames_rejects(void)
 {
     ff_result r;
-    set_strip(&r, 0, 150, 1199, 150 + 769, 400.0);
-    ok(ff_build_frames(&r, 1200, 1100, 5.0, 0.0, FF_FILM_MM, FF_TOP_MM,
-                       FF_HEIGHT_MM, 0) == -1, "absurd pitch refused");
-    set_strip(&r, 0, 150, 1199, 150 + 769, 400.0);
+    ff_geometry geo, bad;
+
+    geom_for(&geo, 400.0);
+    set_strip(&r, 0, 150, 1199, 150 + 734);
+    bad = geo; bad.pitch = 5.0;
+    ok(ff_build_frames(&r, 1200, 1100, &bad, 200, 0.0, FF_FILM_MM, 0) == -1,
+       "absurd pitch refused");
+    set_strip(&r, 0, 150, 1199, 150 + 734);
     r.strip.h = 0;
-    ok(ff_build_frames(&r, 1200, 1100, 0.0, 0.0, FF_FILM_MM, FF_TOP_MM,
-                       FF_HEIGHT_MM, 0) == -1, "zero strip height refused");
-    ok(ff_build_frames(NULL, 1200, 1100, 0.0, 0.0, FF_FILM_MM, FF_TOP_MM,
-                       FF_HEIGHT_MM, 0) == -1, "NULL result refused");
+    ok(ff_build_frames(&r, 1200, 1100, &geo, 200, 0.0, FF_FILM_MM, 0) == -1,
+       "zero strip height refused");
+    ok(ff_build_frames(NULL, 1200, 1100, &geo, 200, 0.0, FF_FILM_MM, 0) == -1,
+       "NULL result refused");
+    ok(ff_build_frames(&r, 1200, 1100, NULL, 200, 0.0, FF_FILM_MM, 0) == -1,
+       "NULL geometry refused");
     printf("  frames: rejects bad input\n");
 }
 
@@ -276,8 +289,8 @@ int main(void)
     test_band_rejects();
     test_pitch();
     test_frames();
-    test_frames_snap_to_strip();
-    test_frames_manual_pitch();
+    test_frames_uniform_size();
+    test_geometry_even();
     test_frames_rejects();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

@@ -11,10 +11,14 @@ trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "    FAIL $1" >&2; exit 1; }
 
-# Geometry: 3 frames of 400px pitch across 1200px, strip y=150..919 (h=770).
-# BH/PITCH = 1.925 matches the real scans (~1375/715), so the pitch search
-# window brackets the true pitch exactly as it does on real film.
-W=1200; H=1100; Y0=150; BH=770; PITCH=400; NF=3
+# Geometry: 3 frames of 400px pitch across 1200px. The strip is sized so the
+# fixture is physically consistent: 735px over 35mm is 21.0 px/mm, and
+# 21.0 * 19.05 = 400.05, so the frame pitch really is PITCH.
+#
+# Scale is taken from the measured pitch, not from the strip height, which is
+# what the expectations below have to follow.
+W=1200; H=1100; Y0=150; BH=735; PITCH=400; NF=3
+FRAME_MM=19.05
 "$MAKE_FIXTURE" "$TMP/a.jpg" "$W" "$H" "$Y0" "$BH" "$PITCH" "$NF"
 # A second, identical scan: every frame must be recognised as a duplicate.
 cp "$TMP/a.jpg" "$TMP/b.jpg"
@@ -23,9 +27,10 @@ echo "  e2e: single scan"
 rm -rf "$TMP/out"
 "$BIN" --outdir "$TMP/out" "$TMP/a.jpg" >/dev/null 2>&1 || fail "framescan exited non-zero"
 
-EXPECT_W=$PITCH
-EXPECT_H=$(awk -v bh="$BH" 'BEGIN{printf "%d", 23.7*bh/35.0+0.5}')
-EXPECT_Y=$(awk -v y0="$Y0" -v bh="$BH" 'BEGIN{printf "%d", y0+7.1*bh/35.0+0.5}')
+PPM=$(awk -v p="$PITCH" -v m="$FRAME_MM" 'BEGIN{printf "%.6f", p/m}')
+EXPECT_W=$(awk -v v="$PITCH" 'BEGIN{printf "%d", int(v+0.5)}' | awk '{print $1 - $1 % 2}')
+EXPECT_H=$(awk -v v="$PPM" 'BEGIN{printf "%d", 23.7*v+0.5}' | awk '{print $1 - $1 % 2}')
+EXPECT_Y=$(awk -v y0="$Y0" -v v="$PPM" 'BEGIN{printf "%d", y0+7.1*v+0.5}')
 
 N=$(ls "$TMP/out"/render/frame_*.png 2>/dev/null | wc -l | tr -d ' ')
 [ "$N" = "$NF" ] || fail "expected $NF frames, got $N"
@@ -51,7 +56,31 @@ N=$(ls "$TMP/out2"/render/frame_*.png 2>/dev/null | wc -l | tr -d ' ')
 [ "$N" = "$NF" ] || fail "duplicate scan not removed: expected $NF frames, got $N"
 DUPS=$(grep -c ',dup_of_' "$TMP/out2/manifest.csv" || true)
 [ "$DUPS" = "$NF" ] || fail "expected $NF dup rows, got $DUPS"
+# The frames must be numbered 0..N-1 with no holes. A duplicate writes no PNG,
+# so if it consumed an index the sequence would skip one, and ffmpeg's image2
+# demuxer stops rendering at the first gap.
+NPNG=$(ls "$TMP/out2"/render/frame_*.png | wc -l | tr -d ' ')
+LAST=$(ls "$TMP/out2"/render/frame_*.png | sed -n 's/.*frame_\([0-9]*\)\.png$/\1/p' | sort -n | tail -1)
+[ "$NPNG" = "$((10#$LAST + 1))" ] \
+  || fail "frame numbering has a hole: $NPNG files but the highest is $LAST"
 echo "    ok duplicates dropped"
+
+echo "  e2e: duplicates leave no hole in the frame numbering"
+# The hole only shows up when kept frames follow the duplicates. Give a copy of
+# a scan two copies of it, then a distinct scan whose frames land after, so the
+# numbering has to stay dense from 0 across the whole run.
+"$MAKE_FIXTURE" "$TMP/h1.jpg" "$W" "$H" "$Y0" "$BH" "$PITCH" "$NF" 0
+cp "$TMP/h1.jpg" "$TMP/h2.jpg"
+"$MAKE_FIXTURE" "$TMP/h3.jpg" "$W" "$H" "$Y0" "$BH" "$PITCH" "$NF" 31337
+rm -rf "$TMP/out13"
+"$BIN" --outdir "$TMP/out13" "$TMP/h1.jpg" "$TMP/h2.jpg" "$TMP/h3.jpg" \
+  >/dev/null 2>&1 || fail "framescan exited non-zero on the interleaved-dup fixture"
+NPNG=$(ls "$TMP/out13"/render/frame_*.png | wc -l | tr -d ' ')
+[ "$NPNG" = "$((NF * 2))" ] || fail "expected $((NF*2)) frames, got $NPNG"
+LAST=$(ls "$TMP/out13"/render/frame_*.png | sed -n 's/.*frame_\([0-9]*\)\.png$/\1/p' | sort -n | tail -1)
+[ "$LAST" = "$(printf '%04d' $((NPNG - 1)))" ] \
+  || fail "duplicates left a hole in the numbering: $NPNG frames but the highest is $LAST"
+echo "    ok"
 
 echo "  e2e: --no-dedup keeps everything"
 rm -rf "$TMP/out3"
@@ -80,10 +109,11 @@ W5=$(awk -F, 'NR>1 && $1==2 {print $6}' "$TMP/out5/manifest.csv")
   || fail "clamped trailing frame should be $((1150 - 2 * PITCH))px wide, got '$W5'"
 echo "    ok"
 
-echo "  e2e: strip snapping absorbs a width mismatch"
-# Film of 393px pitch in a 1180px raster: 1180 is not a multiple of 393, so the
-# grid has to resnap to 1180/3 = 393.33px to tile the strip without cutting the
-# last frame short. The film's own gaps sit at 0/393/786/1179.
+echo "  e2e: the grid uses the measured pitch, not a resnapped one"
+# Film of 393px pitch in a 1180px raster. 1180 is not a multiple of 393, so the
+# grid keeps the measured pitch and the last frame ends one pixel short of the
+# raster edge. The film's own gaps sit at 0/393/786/1179, so the phase comb
+# has to find 0 and the frames have to land on those gaps exactly.
 "$MAKE_FIXTURE" "$TMP/g.jpg" 1180 "$H" "$Y0" "$BH" 393 "$NF"
 rm -rf "$TMP/out8"
 "$BIN" --outdir "$TMP/out8" "$TMP/g.jpg" >/dev/null 2>&1
@@ -96,15 +126,29 @@ LAST=$(awk -F, 'NR>1 && $1==2 {print $4+$6}' "$TMP/out8/manifest.csv")
   || fail "snapped frames should tile the strip, last ends at $LAST"
 echo "    ok"
 
-echo "  e2e: rejects a raster with no film strip"
+echo "  e2e: a raster with no film cannot yield geometry"
+# With only strip-less input there is nothing to measure the film scale from,
+# so the tool has to say so rather than exit 0 having written nothing: a
+# pipeline would otherwise read that as a successful run.
 "$MAKE_FIXTURE" "$TMP/d.jpg" 400 400 0 40 200 1
 rm -rf "$TMP/out6"
-"$BIN" --outdir "$TMP/out6" "$TMP/d.jpg" >/dev/null 2>&1 \
-  || fail "framescan should exit 0 when no strip is found"
+if "$BIN" --outdir "$TMP/out6" "$TMP/d.jpg" >"$TMP/o6" 2>&1; then
+  fail "framescan should exit non-zero when no strip can be measured"
+fi
+grep -q 'frame pitch' "$TMP/o6" || fail "expected a diagnostic about the frame pitch"
 N=$(ls "$TMP/out6"/render/frame_*.png 2>/dev/null | wc -l | tr -d ' ')
 [ "$N" = "0" ] || fail "expected 0 frames from a strip-less raster, got $N"
-KEEP=$(grep -c ',kept' "$TMP/out6/manifest.csv" 2>/dev/null || true)
-[ "$KEEP" = "0" ] || fail "manifest should be empty, got $KEEP kept rows"
+echo "    ok"
+
+echo "  e2e: filmless scans are skipped when others do yield geometry"
+# The real case: one unreadable scan in a roll must not stop the rest.
+rm -rf "$TMP/out6b"
+cp "$TMP/d.jpg" "$TMP/z_stripless.jpg"
+cp "$TMP/a.jpg" "$TMP/a_good.jpg"
+"$BIN" --outdir "$TMP/out6b" "$TMP/a_good.jpg" "$TMP/z_stripless.jpg" \
+  >/dev/null 2>&1 || fail "a stripless scan must not fail the run"
+N=$(ls "$TMP/out6b"/render/frame_*.png 2>/dev/null | wc -l | tr -d ' ')
+[ "$N" = "$NF" ] || fail "expected $NF frames from the one usable scan, got $N"
 echo "    ok"
 
 echo "  e2e: fails loudly on a missing file"

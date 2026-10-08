@@ -26,6 +26,7 @@
 #include "pngwrite.h"
 
 #define SIG_DIM 32
+#define DEF_GEOM_SAMPLE_DEFAULT 24
 #define DEF_DEDUP_THRESH 0.97
 #define MIN_HP_RMS 1.5      /* below this a frame carries no usable identity */
 #define DEF_OUTDIR      "out"
@@ -349,7 +350,9 @@ static void usage(FILE *fp, const char *prog)
 "      --positive          keep the scanned tonality instead of inverting it\n"
 "      --phase PX          x of the first frame's left edge (default autodetect)\n"
 "      --no-phase          do not autodetect phase; start at the strip edge\n"
-"      --pitch PX          force frame pitch instead of autodetecting\n"
+"      --pitch PX          force frame pitch instead of measuring it\n"
+"      --sample N          scans sampled to measure the global geometry\n"
+"                         (default %d; every frame gets the same size)\n"
 "      --film-mm F         film width in mm (default %.1f)\n"
 "      --top-mm F          strip top edge to image top, mm (default %.1f)\n"
 "      --height-mm F       image height, mm (default %.1f)\n"
@@ -360,8 +363,123 @@ static void usage(FILE *fp, const char *prog)
 "      --report            print per-scan geometry to stderr\n"
 "      --dry-run           detect and report, write nothing\n"
 "  -h, --help              this text\n",
-            prog, DEF_OUTDIR, FF_FILM_MM, FF_TOP_MM, FF_HEIGHT_MM,
-            DEF_DEDUP_THRESH);
+            prog, DEF_OUTDIR, DEF_GEOM_SAMPLE_DEFAULT, FF_FILM_MM, FF_TOP_MM,
+            FF_HEIGHT_MM, DEF_DEDUP_THRESH);
+}
+
+/* ------------------------------------------------------- geometry pass */
+
+static int cmp_double(const void *a, const void *b)
+{
+    double x = *(const double *) a, y = *(const double *) b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static double median_of(double *v, int n)
+{
+    if (n <= 0)
+        return 0.0;
+    qsort(v, (size_t) n, sizeof(double), cmp_double);
+    return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+/* Measures the frame pitch, and the strip-top-to-image-top distance, over a
+ * sample of scans spread across the whole set.
+ *
+ * This has to be global rather than per scan. Every per-scan estimate of the
+ * film scale carries a couple of percent of error -- the strip edge is soft, so
+ * its measured height ranged from 1254 to 1409px on this roll -- and letting
+ * the frame size follow it produced PNGs of 902 to 954px. ffmpeg then had to
+ * rescale every frame that did not match the render canvas, and a rescale is
+ * exactly what reads as the film jumping.
+ *
+ * A median over the sample also rejects the scans where the rebate comb locks
+ * onto something else, which a per-scan estimate would simply believe.
+ * Returns 0 if a pitch was established. */
+static int measure_geometry(ff_geometry *geo, char **paths, int n_paths,
+                            int sample, int verbose)
+{
+    double *pitch, *topoff;
+    int np = 0, nt = 0, i, step, bad = 0;
+
+    pitch = malloc(sizeof(double) * (size_t) n_paths);
+    topoff = malloc(sizeof(double) * (size_t) n_paths);
+    if (!pitch || !topoff) {
+        free(pitch);
+        free(topoff);
+        return -1;
+    }
+
+    if (sample < 3)
+        sample = 3;
+    step = n_paths / sample;
+    if (step < 1)
+        step = 1;
+
+    for (i = 0; i < n_paths; i += step) {
+        unsigned char *rgb = NULL, *gray = NULL;
+        int w = 0, h = 0;
+        double p = 0.0, conf = 0.0;
+        ff_strip strip;
+        const char *base = strrchr(paths[i], '/');
+        base = base ? base + 1 : paths[i];
+
+        if (read_jpeg_rgb(paths[i], &rgb, &w, &h) != 0) {
+            bad++;
+            continue;
+        }
+        gray = malloc((size_t) w * h);
+        if (!gray) {
+            free(rgb);
+            break;
+        }
+        rgb_to_gray(rgb, gray, w * h);
+
+        if (ff_find_strip(gray, w, h, &strip) == 0 &&
+            ff_fit_rebate_pitch(gray, w, h, &strip, &p, &conf) == 0 &&
+            conf >= 0.20) {
+            pitch[np++] = p;
+            topoff[nt++] = (double) strip.h;
+        } else {
+            bad++;
+        }
+
+        if (verbose)
+            fprintf(stderr, "  geom %-14s strip_h=%4d pitch=%7.2f conf=%.2f\n",
+                    base, strip.h, p, conf);
+        free(rgb);
+        free(gray);
+    }
+
+    if (np < 1) {
+        fprintf(stderr, "framescan: no scan yielded a usable frame pitch\n");
+        free(pitch);
+        free(topoff);
+        return -1;
+    }
+
+    geo->pitch = median_of(pitch, np);
+    geo->n_scans = np;
+    /* The strip height should come out at FF_FILM_MM * px_per_mm. Log the
+     * spread rather than acting on it: the soft film edge makes the coverage
+     * test overshoot by a row or two, and the median over the sample is what
+     * keeps that from reaching the crop. */
+    if (nt > 0) {
+        double mh = median_of(topoff, nt);
+        if (verbose)
+            fprintf(stderr, "geometry: strip height median %.0f px vs %.0f px "
+                            "expected\n",
+                    mh, geo->pitch / FF_FRAME_MM * FF_FILM_MM);
+    }
+
+    if (verbose)
+        fprintf(stderr, "geometry: pitch %.2f px over %d scans "
+                        "(%.2f px/mm), %d skipped\n",
+                geo->pitch, np, geo->pitch / FF_FRAME_MM, bad);
+
+    free(pitch);
+    free(topoff);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ main */
@@ -374,6 +492,8 @@ int main(int argc, char **argv)
     const char *prefix = "frame";
     double phase = 0.0, pitch_override = 0.0;
     int phase_explicit = 0, phase_auto = 1;
+    int geom_sample = DEF_GEOM_SAMPLE_DEFAULT;
+    ff_geometry geo;
     int rotate = 90, negative = 1;
     double film_mm = FF_FILM_MM, top_mm = FF_TOP_MM, height_mm = FF_HEIGHT_MM;
     double dedup_thresh = DEF_DEDUP_THRESH;
@@ -430,6 +550,13 @@ int main(int argc, char **argv)
         } else if (!strcmp(a, "--pitch")) {
             if (++i >= argc) goto badarg;
             pitch_override = atof(argv[i]);
+        } else if (!strcmp(a, "--sample")) {
+            if (++i >= argc) goto badarg;
+            geom_sample = atoi(argv[i]);
+            if (geom_sample < 3) {
+                fprintf(stderr, "%s: --sample must be at least 3\n", argv[0]);
+                return 2;
+            }
         } else if (!strcmp(a, "--film-mm")) {
             if (++i >= argc) goto badarg;
             film_mm = atof(argv[i]);
@@ -516,6 +643,25 @@ okargs:
         qsort(inputs, (size_t) n_inputs, sizeof(char *), cmp_names);
     }
 
+    ff_geometry_defaults(&geo);
+    if (pitch_override > 0.0) {
+        geo.pitch = pitch_override;
+        geo.n_scans = 0;
+    } else {
+        fprintf(stderr, "%s: measuring global geometry from %d scans\n",
+                argv[0], n_inputs);
+        if (measure_geometry(&geo, inputs, n_inputs, geom_sample, report) != 0) {
+            fprintf(stderr, "%s: cannot measure frame pitch; pass --pitch PX\n",
+                    argv[0]);
+            return 1;
+        }
+    }
+    if (geo.img_top_mm <= 0.0)
+        geo.img_top_mm = top_mm;
+    ff_geometry_finish(&geo, height_mm);
+    fprintf(stderr, "%s: geometry pitch=%.2f px  %.2f px/mm  output %dx%d\n",
+            argv[0], geo.pitch, geo.px_per_mm, geo.out_w, geo.out_h);
+
     if (!dry_run) {
         mkdir(outdir, 0777);
         if (!render_dir) {
@@ -538,8 +684,9 @@ okargs:
 
     for (s = 0; s < n_inputs; s++) {
         unsigned char *rgb = NULL, *gray = NULL;
-        int w = 0, h = 0, y0 = 0, y1 = 0, nf, f;
-        double pitch = 0.0;
+        int w = 0, h = 0, y0 = 0, y1 = 0, nf, f, img_top = 0;
+        int ap = 0, step = 0;
+        double as = 0.0, n_lines_found = -1.0;
         ff_result res;
         const char *base = strrchr(inputs[s], '/');
 
@@ -567,55 +714,79 @@ okargs:
         y0 = res.strip.y0;
         y1 = res.strip.y1;
 
-        if (pitch_override > 0.0) {
-            res.pitch = pitch_override;
-        } else if (ff_fit_pitch(gray, w, h, y0, y1, &pitch) != 0) {
-            fprintf(stderr, "%s: %s: cannot estimate frame pitch\n", argv[0],
-                    base);
+        /* Vertical anchor: the image area starts a fixed distance down the
+         * film, so it follows from the strip top edge and the global scale.
+         *
+         * The old code scaled that distance by this scan's own strip height,
+         * which is the actual bug behind the drifting y offset: strip heights
+         * across this roll run 1255 to 1350px, so a constant 7.1mm became
+         * anything from 254 to 274px and the crop edge moved with it. Holding
+         * px_per_mm global pins the offset at 264px on every scan.
+         */
+        img_top = res.strip.y0 +
+                  (int) (geo.img_top_mm * geo.px_per_mm + 0.5);
+        if (img_top + geo.out_h > h) {
+            fprintf(stderr, "%s: %s: image area runs off the bottom\n",
+                    argv[0], base);
             free(rgb); free(gray);
             continue;
-        } else {
-            res.pitch = pitch;
         }
 
         /* The strip's horizontal extent comes from a column-median test that
          * occasionally collapses onto a short bright section of an otherwise
-         * full-width strip. The autocorrelation is also fooled by the short
-         * strip, so re-estimate the pitch once the strip has been widened. */
-        if (res.strip.w < (int) (3.0 * res.pitch)) {
+         * full-width strip. Widen it rather than trust it. */
+        if (res.strip.w < (int) (3.0 * geo.pitch)) {
             res.strip.x0 = 0;
             res.strip.x1 = w - 1;
             res.strip.w = w;
-            if (pitch_override <= 0.0)
-                ff_fit_pitch(gray, w, h, y0, y1, &res.pitch);
             fprintf(stderr, "%s: %s: strip width implausible, "
                             "assuming full-width film\n", argv[0], base);
         }
 
-        /* Autodetect the frame phase unless the user pinned it. The comb of
-         * frame boundaries has to land on the bright film-base gaps; starting
-         * the grid at the strip edge instead lands it mid-frame. It has to be
-         * fitted with the pitch the grid will use, not the raw estimate. */
-        if (pitch_override <= 0.0)
-            res.pitch = ff_tiled_pitch(&res);
-        if (!phase_explicit && phase_auto && pitch_override <= 0.0) {
-            int ap = 0, step, rel;
-            double as = 0.0;
-            if (ff_fit_phase(gray, w, h, y0, y1, res.pitch, &ap, &as) == 0) {
-                step = (int) (res.pitch + 0.5);
+        /* Locate the frame lines and put the grid on them, unless the user
+         * pinned the phase or asked for the old single-column comb.
+         *
+         * The frame line is a 150-200px band of clear film base spanning the
+         * full image height, so its position can be found directly. Sampling
+         * one column per frame, as ff_fit_phase() does, cannot tell positions
+         * tens of pixels apart inside the same band, and that indeterminacy is
+         * what put picture inside the crop edges on 86% of a full render.
+         *
+         * The lattice is fitted per scan because each scan's own pitch differs
+         * from the roll median by a percent or two, but the crop is still the
+         * global width, so every frame emitted stays the same size. */
+        if (!phase_explicit && phase_auto) {
+            double fx0 = 0.0, fpitch = geo.pitch, fscore = 0.0;
+            if (ff_fit_frame_lines(gray, w, h, y0, y1, geo.pitch,
+                                   &fx0, &fpitch, &fscore) == 0 &&
+                fpitch > 0.5 * geo.pitch && fpitch < 2.0 * geo.pitch) {
+                phase = fx0;
+                while (phase < 0.0)
+                    phase += fpitch;
+                res.phase = (int) phase;
+                res.phase_score = fscore;
+                res.pitch = fpitch;
+                n_lines_found = fscore;
+            } else if (ff_fit_phase(gray, w, h, y0, y1, geo.pitch, &ap, &as) == 0) {
+                /* Fall back to the comb, but only when the frame lines are not
+                 * measurable at all; the comb is a guess inside a band, not a
+                 * measurement of it. */
+                step = (int) (geo.pitch + 0.5);
                 if (step > 0) {
-                    rel = (ap - res.strip.x0) % step;
-                    if (rel < 0)
-                        rel += step;
-                    phase = (double) rel;
-                    res.phase = rel;
+                    phase = (double) (ap % step);
+                    if (phase < 0.0)
+                        phase += step;
+                    res.phase = (int) phase;
                     res.phase_score = as;
+                    n_lines_found = -1.0;
                 }
+            } else {
+                phase = 0.0;
             }
         }
 
-        nf = ff_build_frames(&res, w, h, pitch_override, phase, film_mm,
-                             top_mm, height_mm, include_partial);
+        nf = ff_build_frames(&res, w, h, &geo, img_top, phase, film_mm,
+                             include_partial);
         if (nf <= 0) {
             fprintf(stderr, "%s: %s: no frames fit (pitch %.1f)\n", argv[0],
                     base, res.pitch);
@@ -626,10 +797,10 @@ okargs:
         if (report) {
             fprintf(stderr,
                     "%-14s strip=x%4d..%-4d y%4d..%-4d (%dx%d) pitch=%6.1f "
-                    "phase=%4d score=%.2f frames=%d\n",
+                    "phase=%4d score=%.2f frames=%d found=%.2f\n",
                     base, res.strip.x0, res.strip.x1, res.strip.y0,
                     res.strip.y1, res.strip.w, res.strip.h, res.pitch,
-                    res.phase, res.phase_score, nf);
+                    res.phase, res.phase_score, nf, n_lines_found);
         }
 
         for (f = 0; f < nf; f++) {
@@ -663,10 +834,15 @@ okargs:
                 if (csv) {
                     int ow, oh;
                     oriented_size(bx->w, bx->h, rotate, &ow, &oh);
-                    fprintf(csv, "%d,%s,%d,%d,%d,%d,%d,dup_of_%d,%d,%d\n", index,
+                    /* The row carries the index of the frame it duplicates and
+                     * does not consume one of its own. A duplicate has no PNG,
+                     * so spending an index on it would leave a hole in the
+                     * frame_%04d sequence, and ffmpeg's image2 demuxer stops
+                     * dead at the first gap -- which is how two deduplicated
+                     * frames once truncated the render at 1457 of 2805. */
+                    fprintf(csv, "%d,%s,%d,%d,%d,%d,%d,dup_of_%d,%d,%d\n", dup,
                             base, f, bx->x0, bx->y0, bx->w, bx->h, dup, ow, oh);
                 }
-                index++;
                 continue;
             }
 
