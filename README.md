@@ -1,12 +1,11 @@
 # 8mmScan
 
-Finds the individual frames on scans of a 35mm film strip and writes them out
-as numbered PNGs, ready to be muxed into a video.
+Two film scanning pipelines:
 
-The frames run along the length of the strip, so a scan shows the whole reel
-sideways: one long horizontal band of film, with the frames repeating across it
-and clear film base in the gaps between them. `framescan` locates that band,
-works out where the film actually starts, and cuts one PNG per frame.
+- **framescan** — 35mm film strips (Bell & Howell, 4 perfs/frame)
+- **mm8scan** — 8mm film strips (Super 8 / Regular 8, sprocket-hole based)
+
+Both write numbered PNGs ready to mux into video.
 
 ## Building
 
@@ -14,7 +13,16 @@ Needs a C99 compiler, libjpeg and libpng.
 
     make
 
-## Using it
+Produces two binaries: `framescan` and `mm8scan`.
+
+## 35mm pipeline (framescan)
+
+The frames run along the length of the strip, so a scan shows the whole reel
+sideways: one long horizontal band of film, with the frames repeating across it
+and clear film base in the gaps between them. `framescan` locates that band,
+works out where the film actually starts, and cuts one PNG per frame.
+
+### Using it
 
     ./framescan -o out scans/
 
@@ -37,11 +45,12 @@ To mux the frames into a video:
 
 which runs `ffmpeg` over the numbered PNGs at 18 fps and writes `out/frames.mp4`.
 
-## Options worth knowing
+### Key options
 
     --rotate DEG        0, 90, 180 or 270 (default 90)
     --positive          keep the scanned tonality instead of inverting it
-    --report            print the geometry found for each scan
+    --sample N          scans sampled for global geometry (default 24)
+    --report            print geometry found for each scan
     --dry-run           detect and report, write nothing
     --include-partial   also emit frames clipped by the image edge
     --no-dedup          keep every frame, including overlaps
@@ -49,23 +58,57 @@ which runs `ffmpeg` over the numbered PNGs at 18 fps and writes `out/frames.mp4`
 `--report` is the first thing to reach for when a scan comes out wrong; it
 prints the strip position, the frame pitch and a confidence score per scan.
 
-## How it finds the frames
+### How it finds the frames
 
-The pitch is found by autocorrelating the strip along its length, which peaks
-once per frame. That tells you how wide the frames are, but not where the first
-one starts — and getting that wrong cuts every frame in half with a strip of
-film base down the middle.
+1. **Strip detection**: coverage test (not brightness) finds the film band
+2. **Global pitch**: median of rebate autocorrelation over a sample of scans
+   — this is the only pitch measurement used; per-scan estimates are discarded
+3. **Per-scan phase**: `ff_fit_frame_lines` finds the actual frame lines
+   (150–200px wide bands of clear film base) and fits a lattice
+4. **Frame grid**: built from global pitch + per-scan phase, all frames same size
+5. **Deduplication**: 32×32 high-pass signature, cosine similarity ≥ 0.97
 
-So the phase is measured separately. Clear film base is not just brighter than
-the picture, it is almost perfectly *uniform* from the top of the image area to
-the bottom, and that holds however bright the scene is. Keying on uniformity
-rather than brightness is what keeps this working on high-key frames where the
-picture is as bright as the base and a brightness profile flattens out.
+The global geometry is the key: every scan gets the same `out_w × out_h`, so
+ffmpeg never rescale-and-jitter.
 
-The tool scans every integer phase, scores the uniformity underneath a comb of
-frame boundaries, and keeps the best. The mean uniformity under that comb is
-reported as `score`: a low score means that scan has no clear base gaps to lock
-onto, and its frames are worth eyeballing.
+## 8mm pipeline (mm8scan)
+
+For 8mm film (Super 8 or Regular 8), the reference is the row of sprocket holes
+along the film edge. `mm8scan` detects them, corrects scanner skew, extracts
+frames, and stabilizes frame-to-frame using the sprocket holes as fiducials.
+
+### Using it
+
+    ./mm8scan -o out scans/
+
+Output structure matches `framescan`: PNGs in `out/render/`, manifest in
+`out/manifest.csv`.
+
+### Pipeline
+
+1. **Threshold + connected components** → sprocket candidates
+2. **Filter** by size/aspect/circularity → valid sprockets
+3. **Theil-Sen line fit** → strip angle (skew) + pitch (sprocket spacing)
+4. **Deskew**: rotate full scan by `-angle` (bilinear)
+5. **Frame boxes** from geometry (fixed offsets from sprocket centres)
+6. **Frame-to-frame stabilization**:
+   - Detect sprockets in each frame crop
+   - Match adjacent frames by vertical proximity
+   - Solve 6-DOF affine (translation + rotation + scale)
+   - Accumulate transforms with optional moving-average smoothing
+   - Inverse-warp each frame by its cumulative transform
+7. **Deduplication** (reuses 35mm high-pass signature)
+8. **Write** PNGs + manifest
+
+### Key options
+
+    --sprocket-thresh N   threshold for sprocket detection (default 220)
+    --frame-w N           output frame width (default 400)
+    --frame-h N           output frame height (default 300)
+    --offset-x N          sprocket-centre → frame left edge (default 50)
+    --offset-y N          sprocket-centre → frame top edge (default -150)
+    --stabilize-window N  trajectory smoothing window (default 3, 0 = off)
+    --max-affine-rms N    reject affine if RMS > N px (default 3.0)
 
 ## Tests
 
