@@ -42,10 +42,14 @@
  * After: comp_id[y*w+x] = component label (1..ncomp).
  * Returns number of components found (0 if none). */
 static int cc8(const unsigned char *bin, int w, int h,
-               int *comp, int *comp_w, int *comp_h, int *comp_area)
+               int *comp, int **comp_w, int **comp_h, int **comp_area)
 {
     int ncomp = 0;
     int x, y;
+    size_t qsize = (size_t)w * (size_t)h;
+    int *q = malloc(qsize * sizeof(int));
+    if (!q)
+        return 0;
 
     /* First pass: label */
     for (y = 0; y < h; y++) {
@@ -55,7 +59,6 @@ static int cc8(const unsigned char *bin, int w, int h,
             /* BFS */
             int label = ncomp + 1;
             int qh = 0, qt = 0;
-            int q[w * h];
             q[qt++] = y * w + x;
             comp[y * w + x] = label;
             while (qh < qt) {
@@ -99,50 +102,52 @@ static int cc8(const unsigned char *bin, int w, int h,
             ncomp++;
         }
     }
+    free(q);
 
     /* Second pass: compute stats */
-    if (ncomp <= 0) {
-        for (y = 0; y < h; y++)
-            for (x = 0; x < w; x++)
-                if (comp[y * w + x] != 0) {
-                    /* already labeled, stats will be overcounted -- skip */
-                }
+    if (ncomp <= 0)
+        return ncomp;
+
+    *comp_w = calloc((size_t)ncomp, sizeof(int));
+    *comp_h = calloc((size_t)ncomp, sizeof(int));
+    *comp_area = calloc((size_t)ncomp, sizeof(int));
+    if (!*comp_w || !*comp_h || !*comp_area) { free(*comp_w); free(*comp_h); free(*comp_area); return ncomp; }
+
+    int *minx = malloc((size_t) ncomp * sizeof(int));
+    int *maxx = malloc((size_t) ncomp * sizeof(int));
+    int *miny = malloc((size_t) ncomp * sizeof(int));
+    int *maxy = malloc((size_t) ncomp * sizeof(int));
+    if (!minx || !maxx || !miny || !maxy) {
+        free(minx); free(maxx); free(miny); free(maxy);
         return ncomp;
     }
-
-    memset(comp_w, 0, (size_t) ncomp * sizeof(int));
-    memset(comp_h, 0, (size_t) ncomp * sizeof(int));
-    memset(comp_area, 0, (size_t) ncomp * sizeof(int));
+    for (int i = 0; i < ncomp; i++) {
+        minx[i] = w; maxx[i] = -1; miny[i] = h; maxy[i] = -1;
+    }
 
     for (y = 0; y < h; y++) {
         for (x = 0; x < w; x++) {
             int c = comp[y * w + x];
-            if (c > 0) {
-                comp_w[c - 1]++;
-                comp_h[c - 1]++;
-                comp_area[c - 1]++;
+            if (c > 0 && c <= ncomp) {
+                (*comp_area)[c - 1]++;
+                if (x < minx[c - 1]) minx[c - 1] = x;
+                if (x > maxx[c - 1]) maxx[c - 1] = x;
+                if (y < miny[c - 1]) miny[c - 1] = y;
+                if (y > maxy[c - 1]) maxy[c - 1] = y;
             }
         }
-    }
-    /* comp_h was incremented per-row, not per-pixel; fix: count rows with pixels */
-    {
-        int *row_count = calloc(ncomp, sizeof(int));
-        for (y = 0; y < h; y++) {
-            int first = -1;
-            for (x = 0; x < w; x++) {
-                int c = comp[y * w + x];
-                if (c > 0) {
-                    if (first < 0) first = c;
-                }
-            }
-            if (first >= 0) row_count[first - 1]++;
-        }
-        for (int i = 0; i < ncomp; i++) {
-            comp_h[i] = row_count[i];
-        }
-        free(row_count);
     }
 
+    for (int i = 0; i < ncomp; i++) {
+        if (maxx[i] < minx[i] || maxy[i] < miny[i]) {
+            (*comp_w)[i] = 0; (*comp_h)[i] = 0;
+        } else {
+            (*comp_w)[i] = maxx[i] - minx[i] + 1;
+            (*comp_h)[i] = maxy[i] - miny[i] + 1;
+        }
+    }
+
+    free(minx); free(maxx); free(miny); free(maxy);
     return ncomp;
 }
 
@@ -201,8 +206,38 @@ int sf_find_sprockets(const unsigned char *gray, int w, int h,
 
     /* Step 2: connected components */
     int *comp = calloc((size_t) w * h, sizeof(int));
-    int comp_w[SF_MAX_SPROCKETS], comp_h[SF_MAX_SPROCKETS], comp_area[SF_MAX_SPROCKETS];
-    int ncomp = cc8(bin, w, h, comp, comp_w, comp_h, comp_area);
+    int *comp_w = NULL, *comp_h = NULL, *comp_area = NULL;
+    int ncomp = cc8(bin, w, h, comp, &comp_w, &comp_h, &comp_area);
+    if (ncomp == 0) {
+        free(comp); comp = calloc((size_t)w*h, sizeof(int));
+        free(comp_w); free(comp_h); free(comp_area); comp_w=comp_h=comp_area=NULL;
+        free(bin);
+        thr = 160;
+        bin = malloc((size_t)w*h);
+        if (!bin) return -1;
+        for (int i = 0; i < w*h; i++) bin[i] = (gray[i] > thr) ? 255 : 0;
+        ncomp = cc8(bin, w, h, comp, &comp_w, &comp_h, &comp_area);
+    }
+    if (ncomp == 0) {
+        free(comp); comp = calloc((size_t)w*h, sizeof(int));
+        free(comp_w); free(comp_h); free(comp_area); comp_w=comp_h=comp_area=NULL;
+        free(bin);
+        thr = 140;
+        bin = malloc((size_t)w*h);
+        if (!bin) return -1;
+        for (int i = 0; i < w*h; i++) bin[i] = (gray[i] > thr) ? 255 : 0;
+        ncomp = cc8(bin, w, h, comp, &comp_w, &comp_h, &comp_area);
+    }
+    if (ncomp == 0) {
+        free(comp); comp = calloc((size_t)w*h, sizeof(int));
+        free(comp_w); free(comp_h); free(comp_area); comp_w=comp_h=comp_area=NULL;
+        free(bin);
+        thr = 120;
+        bin = malloc((size_t)w*h);
+        if (!bin) return -1;
+        for (int i = 0; i < w*h; i++) bin[i] = (gray[i] > thr) ? 255 : 0;
+        ncomp = cc8(bin, w, h, comp, &comp_w, &comp_h, &comp_area);
+    }
     free(comp);
     free(bin);
 
@@ -246,6 +281,7 @@ int sf_find_sprockets(const unsigned char *gray, int w, int h,
 
     /* Free and return partial / rebuilt */
     free(cands);
+    free(comp_w); free(comp_h); free(comp_area);
     *out_n = 0;
     return 0;
 }
@@ -446,29 +482,105 @@ unsigned char *sf_deskew(const unsigned char *gray, int w, int h, double angle,
 int sf_frame_sprockets(const unsigned char *gray, int w, int h, const ff_box *box,
                        int max_pts, int *out_pts_x, int *out_pts_y)
 {
-    /* Simple threshold + centroid within box.
-     * Sprockets in a frame crop should appear as bright circular regions.
-     */
+    (void)max_pts;
     unsigned char *bin = malloc((size_t)w * h);
     if (!bin) return 0;
-    int thr = 220; /* fixed high threshold for bright sprockets */
+    int thr = 220;
     for (int i = 0; i < w * h; i++)
         bin[i] = (gray[i] > thr) ? 255 : 0;
 
-    /* Connected components within the whole image, then filter by box */
     int *comp = calloc((size_t)w * h, sizeof(int));
     if (!comp) { free(bin); return 0; }
-    /* Quick 4-connectivity */
+
+    int ncomp = 0;
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             if (bin[y * w + x] == 0 || comp[y * w + x] != 0) continue;
-            /* For brevity, just find any bright blob and check if its centre is in box */
-            /* In production: proper CCL + stats */
+            int label = ncomp + 1;
+            int qh = 0, qt = 0;
+            int *q = malloc((size_t)w * h * sizeof(int));
+            if (!q) break;
+            q[qt++] = y * w + x;
+            comp[y * w + x] = label;
+            while (qh < qt) {
+                int p = q[qh++];
+                int py = p / w, px = p % w;
+                if (py > 0 && bin[(py-1)*w+px] && comp[(py-1)*w+px] == 0) {
+                    comp[(py-1)*w+px] = label; q[qt++] = (py-1)*w+px;
+                }
+                if (py < h-1 && bin[(py+1)*w+px] && comp[(py+1)*w+px] == 0) {
+                    comp[(py+1)*w+px] = label; q[qt++] = (py+1)*w+px;
+                }
+                if (px > 0 && bin[py*w+(px-1)] && comp[py*w+(px-1)] == 0) {
+                    comp[py*w+(px-1)] = label; q[qt++] = py*w+(px-1);
+                }
+                if (px < w-1 && bin[py*w+(px+1)] && comp[py*w+(px+1)] == 0) {
+                    comp[py*w+(px+1)] = label; q[qt++] = py*w+(px+1);
+                }
+                if (py>0 && px>0 && bin[(py-1)*w+(px-1)] && comp[(py-1)*w+(px-1)]==0) {
+                    comp[(py-1)*w+(px-1)]=label; q[qt++] = (py-1)*w+(px-1);
+                }
+                if (py>0 && px<w-1 && bin[(py-1)*w+(px+1)] && comp[(py-1)*w+(px+1)]==0) {
+                    comp[(py-1)*w+(px+1)]=label; q[qt++] = (py-1)*w+(px+1);
+                }
+                if (py<h-1 && px>0 && bin[(py+1)*w+(px-1)] && comp[(py+1)*w+(px-1)]==0) {
+                    comp[(py+1)*w+(px-1)]=label; q[qt++] = (py+1)*w+(px-1);
+                }
+                if (py<h-1 && px<w-1 && bin[(py+1)*w+(px+1)] && comp[(py+1)*w+(px+1)]==0) {
+                    comp[(py+1)*w+(px+1)]=label; q[qt++] = (py+1)*w+(px+1);
+                }
+            }
+            free(q);
+            ncomp++;
         }
     }
-    /* For now: just return 0 placeholder; full CCL to be added */
+
+    int *minx = calloc(ncomp, sizeof(int));
+    int *maxx = calloc(ncomp, sizeof(int));
+    int *miny = calloc(ncomp, sizeof(int));
+    int *maxy = calloc(ncomp, sizeof(int));
+    long *area = calloc(ncomp, sizeof(long));
+    if (minx && maxx && miny && maxy && area) {
+        for (int i = 0; i < ncomp; i++) {
+            minx[i] = w; maxx[i] = -1; miny[i] = h; maxy[i] = -1;
+        }
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int c = comp[y * w + x];
+                if (c > 0 && c <= ncomp) {
+                    area[c-1]++;
+                    if (x < minx[c-1]) minx[c-1] = x;
+                    if (x > maxx[c-1]) maxx[c-1] = x;
+                    if (y < miny[c-1]) miny[c-1] = y;
+                    if (y > maxy[c-1]) maxy[c-1] = y;
+                }
+            }
+        }
+    }
+
+    int nout = 0;
+    if (minx && maxx && miny && maxy && area) {
+        for (int i = 0; i < ncomp && nout < max_pts; i++) {
+            if (area[i] < 10) continue;
+            int cxm = minx[i] + (maxx[i] - minx[i] + 1)/2;
+            int cym = miny[i] + (maxy[i] - miny[i] + 1)/2;
+            if (box) {
+                int bx0 = (int)box->x0, by0 = (int)box->y0;
+                if (cxm < bx0-5 || cxm > bx0 + (int)box->w+5 ||
+                    cym < by0-5 || cym > by0 + (int)box->h+5)
+                    continue;
+            }
+            if (nout < max_pts) {
+                if (out_pts_x) out_pts_x[nout] = cxm;
+                if (out_pts_y) out_pts_y[nout] = cym;
+                nout++;
+            }
+        }
+    }
+
+    free(minx); free(maxx); free(miny); free(maxy); free(area);
     free(bin); free(comp);
-    return 0;
+    return nout;
 }
 
 /* -------------------------------------------------------------- sf_apply_affine */

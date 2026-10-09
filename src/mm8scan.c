@@ -215,7 +215,7 @@ int main(int argc, char **argv)
         int n_sprockets = 0;
         if (sf_find_sprockets(gray, w, h, sprockets, &n_sprockets) < 0) {
             fprintf(stderr, "mm8scan: sprocket detection failed for %s\n", path);
-            free(rgb); free(gray); free(inputs[s]); continue;
+            free(rgb); free(gray); continue;
         }
 
         /* Step 2: filter */
@@ -227,7 +227,7 @@ int main(int argc, char **argv)
         sf_strip_geometry geo;
         if (sf_fit_strip_geometry(filtered, n_filtered, &geo) < 0) {
             fprintf(stderr, "mm8scan: strip geometry fit failed\n");
-            free(rgb); free(gray); free(sprockets); free(filtered); free(inputs[s]); continue;
+            free(rgb); free(gray); free(sprockets); free(filtered); continue;
         }
 
         /* Step 4: deskew - rotate full scan by -angle */
@@ -235,7 +235,7 @@ int main(int argc, char **argv)
                                           &w, &h);
         if (!upright) {
             fprintf(stderr, "mm8scan: deskew failed\n");
-            free(rgb); free(gray); free(sprockets); free(filtered); free(inputs[s]); continue;
+            free(rgb); free(gray); free(sprockets); free(filtered); continue;
         }
         free(gray); /* replaced by upright */
         gray = upright;
@@ -251,7 +251,7 @@ int main(int argc, char **argv)
 
         if (sf_build_frames(&geo, w, h, img_top_px, phase, frames, &n_frames) < 0) {
             fprintf(stderr, "mm8scan: frame build failed\n");
-            free(rgb); free(gray); free(sprockets); free(filtered); free(inputs[s]); continue;
+            free(rgb); free(gray); free(sprockets); free(filtered); continue;
         }
 
         /* Step 7: extract frame crops (grayscale) */
