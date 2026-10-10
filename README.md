@@ -1,11 +1,10 @@
 # 8mmScan
 
-Two film scanning pipelines:
+Single-pipeline film scanner:
 
-- **framescan** — 35mm film strips (Bell & Howell, 4 perfs/frame)
-- **mm8scan** — 8mm film strips (Super 8 / Regular 8, sprocket-hole based)
-
-Both write numbered PNGs ready to mux into video.
+- **framescan** — 8mm film strips (Super 8). Produces frame PNGs with global,
+  position-dependent geometry correction calibrated for the **RODFS50** flatbed
+  scanner, and writes numbered PNGs ready to mux into video.
 
 ## Building
 
@@ -13,7 +12,7 @@ Needs a C99 compiler, libjpeg and libpng.
 
     make
 
-Produces two binaries: `framescan` and `mm8scan`.
+Produces a single binary: `framescan`.
 
 ## 35mm pipeline (framescan)
 
@@ -54,61 +53,40 @@ which runs `ffmpeg` over the numbered PNGs at 18 fps and writes `out/frames.mp4`
     --dry-run           detect and report, write nothing
     --include-partial   also emit frames clipped by the image edge
     --no-dedup          keep every frame, including overlaps
+    --no-stabilize      disable frame-to-frame affine stabilization
+    --fps N             not used (reserved)
+    --pattern           include all images in directory recursively
 
-`--report` is the first thing to reach for when a scan comes out wrong; it
-prints the strip position, the frame pitch and a confidence score per scan.
+`--report` prints the strip position, pitch/angle and frames per scan.
 
-### How it finds the frames
+### How it finds the frames (8mm, RODFS50)
 
-1. **Strip detection**: coverage test (not brightness) finds the film band
-2. **Global pitch**: median of rebate autocorrelation over a sample of scans
-   — this is the only pitch measurement used; per-scan estimates are discarded
-3. **Per-scan phase**: `ff_fit_frame_lines` finds the actual frame lines
-   (150–200px wide bands of clear film base) and fits a lattice
-4. **Frame grid**: built from global pitch + per-scan phase, all frames same size
-5. **Deduplication**: 32×32 high-pass signature, cosine similarity ≥ 0.97
+1. **Strip detection**: profile/coverage based; band position is determined
+   per scan (not fixed) because it drifts between scans.
+2. **Skew & geometry**: strip tilt is estimated from band edge slopes; a small
+   per-scan rotation corrects skew, then the film band is extracted.
+3. **Position-dependent geometry correction**: the sprocket row and the
+   opposite edge run at slightly different effective pitches along the scanner
+   (keystone/barrel in the optical path). Rather than warping each frame, the
+   correction is applied **globally per scanner** as a linear factor `grad`
+   across the band (row-wise scaling about the horizontal centre). For
+   `RODFS50` the global model (`pitch`, `grad`, `band_h`, `frame_w/h`, `offset_x/y`)
+   is measured from a sample of scans and reused for all; only the band
+   position, strip angle and lattice phase vary per scan.
+4. **Lattice**: Super 8 has one perforation per frame; the position-dependent
+   rectified image is analyzed to recover pitch and phase on the rectified
+   band, and frames are cut on a fixed grid (`pitch + offset_x`, centred
+   vertically by `offset_y`).
+5. **Stabilization**: frame-to-frame affine stabilization using sprocket
+   fiducials (translation-only if only one perf is tracked; full affine
+   otherwise). Optional smoothing.
+6. **Deduplication**: 32×32 high-pass signature, cosine similarity ≥ 0.97.
 
-The global geometry is the key: every scan gets the same `out_w × out_h`, so
-ffmpeg never rescale-and-jitter.
+### Calibration
 
-## 8mm pipeline (mm8scan)
-
-For 8mm film (Super 8 or Regular 8), the reference is the row of sprocket holes
-along the film edge. `mm8scan` detects them, corrects scanner skew, extracts
-frames, and stabilizes frame-to-frame using the sprocket holes as fiducials.
-
-### Using it
-
-    ./mm8scan -o out scans/
-
-Output structure matches `framescan`: PNGs in `out/render/`, manifest in
-`out/manifest.csv`.
-
-### Pipeline
-
-1. **Threshold + connected components** → sprocket candidates
-2. **Filter** by size/aspect/circularity → valid sprockets
-3. **Theil-Sen line fit** → strip angle (skew) + pitch (sprocket spacing)
-4. **Deskew**: rotate full scan by `-angle` (bilinear)
-5. **Frame boxes** from geometry (fixed offsets from sprocket centres)
-6. **Frame-to-frame stabilization**:
-   - Detect sprockets in each frame crop
-   - Match adjacent frames by vertical proximity
-   - Solve 6-DOF affine (translation + rotation + scale)
-   - Accumulate transforms with optional moving-average smoothing
-   - Inverse-warp each frame by its cumulative transform
-7. **Deduplication** (reuses 35mm high-pass signature)
-8. **Write** PNGs + manifest
-
-### Key options
-
-    --sprocket-thresh N   threshold for sprocket detection (default 220)
-    --frame-w N           output frame width (default 400)
-    --frame-h N           output frame height (default 300)
-    --offset-x N          sprocket-centre → frame left edge (default 50)
-    --offset-y N          sprocket-centre → frame top edge (default -150)
-    --stabilize-window N  trajectory smoothing window (default 3, 0 = off)
-    --max-affine-rms N    reject affine if RMS > N px (default 3.0)
+This build uses geometry calibrated for scanner **RODFS50** (found in EXIF of
+the provided scans). If you use a different scanner, the global `grad` and the
+default framing may need re-calibration.
 
 ## Tests
 

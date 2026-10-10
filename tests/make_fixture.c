@@ -1,15 +1,13 @@
-/* make_fixture.c - write a synthetic 35mm scan with known geometry, for the
+/* make_fixture.c - write a synthetic Super-8 scan with known geometry, for the
  * end-to-end test. Not part of the shipped tool.
  *
  * usage: make_fixture <out.jpg> <w> <h> <band_y0> <band_h> <pitch> <nframes>
  *                     [seed_off] [blank_frame] [leader]
  *
- * leader shifts the frame run sideways, so the strip edge and the first frame
- * boundary do not coincide.
- *
- * seed_off changes the per-frame pattern so two fixtures with the same
- * geometry hold genuinely different pictures. blank_frame leaves one frame
- * with no texture, as an unexposed or blank frame would be.
+ * Each cell holds one perforation on the top rebate and a picture below it.
+ * leader shifts the frame run sideways, so the strip edge and the first
+ * perforation do not coincide. seed_off changes the per-frame pattern so two
+ * fixtures with the same geometry hold genuinely different pictures.
  */
 #include <stdio.h>
 #include <stdlib.h>

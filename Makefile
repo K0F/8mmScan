@@ -8,10 +8,10 @@ PNG_CFLAGS  := $(shell pkg-config --cflags libpng 2>/dev/null)
 PNG_LIBS    := $(shell pkg-config --libs   libpng 2>/dev/null || echo -lpng)
 MATH_LIBS   := $(shell pkg-config --libs   zlib 2>/dev/null || echo -lz)
 
-BIN     := framescan mm8scan
+BIN     := framescan
 BUILD   := build
-OBJS    := $(BUILD)/framescan.o $(BUILD)/filmfind.o $(BUILD)/pngwrite.o
-MM8OBJS := $(BUILD)/mm8scan.o $(BUILD)/sprocketfind.o $(BUILD)/stabilize.o $(BUILD)/pngwrite.o $(BUILD)/filmfind.o
+OBJS    := $(BUILD)/framescan.o $(BUILD)/sprocketfind.o \
+           $(BUILD)/stabilize.o $(BUILD)/pngwrite.o
 
 SCANS     ?= scans
 OUT       ?= out
@@ -25,49 +25,43 @@ FPS       ?= 18
 RENDER_FILTER ?= setsar=1,scale=trunc(iw/2)*2:trunc(ih/2)*2
 MP4       ?= $(OUT)/frames.mp4
 
-.PHONY: all test unit e2e clean frames render mm8frames mm8render
+.PHONY: all test unit e2e clean frames render
 
 all: $(BIN)
 
-framescan: $(OBJS)
+$(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(JPEG_LIBS) $(PNG_LIBS) $(MATH_LIBS) -lm
-
-mm8scan: $(MM8OBJS)
-	$(CC) $(CFLAGS) -o $@ $(MM8OBJS) $(JPEG_LIBS) $(PNG_LIBS) $(MATH_LIBS) -lm
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(JPEG_CFLAGS) $(PNG_CFLAGS) -c -o $@ $<
 
-$(BUILD)/test_filmfind: tests/test_filmfind.c tests/fixture.h src/filmfind.c | $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Itests -o $@ tests/test_filmfind.c src/filmfind.c -lm
-
-$(BUILD)/make_fixture: tests/make_fixture.c tests/fixture.h | $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(JPEG_CFLAGS) -Itests -o $@ tests/make_fixture.c $(JPEG_LIBS)
-
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(OBJS): src/filmfind.h | $(BUILD)
-$(BUILD)/framescan.o $(BUILD)/pngwrite.o: src/pngwrite.h
+$(BUILD)/framescan.o: src/sprocketfind.h src/stabilize.h src/pngwrite.h
+$(BUILD)/sprocketfind.o: src/sprocketfind.h
+$(BUILD)/stabilize.o: src/stabilize.h src/sprocketfind.h
+$(BUILD)/pngwrite.o: src/pngwrite.h
 
-unit: $(BUILD)/test_filmfind
-	@$(BUILD)/test_filmfind
+$(BUILD)/make_fixture: tests/make_fixture.c tests/fixture.h | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(JPEG_CFLAGS) -Itests -o $@ \
+	  tests/make_fixture.c $(JPEG_LIBS)
 
 $(BUILD)/png_pixel: tests/png_pixel.c | $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(PNG_CFLAGS) -o $@ tests/png_pixel.c $(PNG_LIBS) $(MATH_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(PNG_CFLAGS) -o $@ tests/png_pixel.c \
+	  $(PNG_LIBS) $(MATH_LIBS)
+
+unit:
+	@echo "no unit tests for the 8mm pipeline (covered by e2e)"
 
 e2e: all $(BUILD)/make_fixture $(BUILD)/png_pixel
 	@sh tests/e2e.sh
 
 test: unit e2e
 
-## Extract cropped frames into $(OUT)/render
+## Extract cropped, stabilized frames into $(OUT)/render
 frames: all
 	./$(BIN) -o $(OUT) $(SCANS)
-
-## Extract 8mm frames with stabilization into $(OUT)/render
-mm8frames: mm8scan
-	./mm8scan -o $(OUT) $(SCANS)
 
 ## Extract frames and mux them into $(MP4) at $(FPS) fps
 render: frames
@@ -79,16 +73,6 @@ render: frames
 	  -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p -r $(FPS) \
 	  -movflags +faststart $(MP4)
 	@echo "rendered $(MP4) at $(FPS) fps"
-
-mm8render: mm8frames
-	@command -v ffmpeg >/dev/null 2>&1 || { \
-	  echo "ffmpeg not found in PATH; install it to build $(MP4); exit 1; }
-	ffmpeg -hide_banner -loglevel error -y \
-	  -framerate $(FPS) -i $(OUT)/render/frame_%04d.png \
-	  -vf "$(RENDER_FILTER)" \
-	  -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p -r $(FPS) \
-	  -movflags +faststart $(MP4)
-	@echo "rendered stabilized $(MP4) at $(FPS) fps"
 
 clean:
 	rm -rf $(BUILD) $(BIN)
