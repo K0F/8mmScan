@@ -63,8 +63,10 @@ which runs `ffmpeg` over the numbered PNGs at 18 fps and writes `out/frames.mp4`
 
 1. **Strip detection**: profile/coverage based; band position is determined
    per scan (not fixed) because it drifts between scans.
-2. **Skew & geometry**: strip tilt is estimated from band edge slopes; a small
-   per-scan rotation corrects skew, then the film band is extracted.
+2. **Geometry**: strip tilt is estimated from the sprocket-hole row; the
+   per-scan lattice (pitch and phase) comes directly from the hole
+   positions.  The band is extracted with the fixed RODFS50 position-
+   dependent correction (no per-scan rotation).
 3. **Position-dependent geometry correction**: the sprocket row and the
    opposite edge run at slightly different effective pitches along the scanner
    (keystone/barrel in the optical path). Rather than warping each frame, the

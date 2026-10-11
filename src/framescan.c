@@ -3,13 +3,13 @@
  * 8mm-only pipeline.  Per scan:
  *   1. decode to RGB and derive an 8-bit luma raster
  *   2. sf_find_band()            -> the horizontal film band
- *   3. sf_find_sprockets()       -> the sprocket holes along the rebate
- *   4. sf_fit_strip_geometry()   -> strip angle, pitch and hole row
- *   5. deskew the whole scan by the strip angle
- *   6. re-detect holes on the upright scan and place frame boxes on the
- *      sprocket pitch (one frame advance per hole)
- *   7. stabilize each frame against the first using sprocket fiducials
- *   8. rotate upright, invert, deduplicate and write numbered PNGs
+ *   3. sf_extract_band(angle=0)  -> pull the band, apply only the global
+ *      position-dependent correction (no skew rotation)
+ *   4. sf_find_sprockets() + sf_fit_strip_geometry() -> hole row: pitch,
+ *      phase and strip angle (from the holes, never the picture)
+ *   5. place frame boxes on the hole lattice
+ *   6. stabilize each frame against the first using sprocket fiducials
+ *   7. rotate upright, invert, deduplicate and write numbered PNGs
  *
  * The frame size, pitch and offsets are measured once, over a sample of the
  * whole set, so every emitted PNG has identical dimensions.  A per-frame size
@@ -421,6 +421,9 @@ static int measure_geometry(struct geo8 *geo, char **paths, int n_paths,
         unsigned char *rgb = NULL, *gray = NULL;
         int w = 0, h = 0, y0 = 0, y1 = 0;
         sf_band b;
+        sf_strip_geometry strip;
+        sf_sprocket sp[SF_MAX_SPROCKETS], spf[SF_MAX_SPROCKETS];
+        int nsp = 0, nspf = 0;
         const char *base = strrchr(paths[i], '/');
         base = base ? base + 1 : paths[i];
 
@@ -437,25 +440,42 @@ static int measure_geometry(struct geo8 *geo, char **paths, int n_paths,
         rgb_to_gray(rgb, gray, w * h);
         free(rgb);
 
-        if (sf_find_band(gray, w, h, &y0, &y1) != 0 ||
-            sf_analyze_band(gray, w, h, y0, y1, PITCH_LO, PITCH_HI, &b) != 0) {
+        if (sf_find_band(gray, w, h, &y0, &y1) != 0) {
+            free(gray);
+            bad++;
+            continue;
+        }
+
+        /* Reference pitch from the sprocket holes; grad and band height from
+         * the band profile, because the single Super-8 hole row cannot by
+         * itself measure the across-strip pitch change. */
+        memset(&strip, 0, sizeof strip);
+        if (sf_find_sprockets(gray, w, h, y0, y1, sp, &nsp) >= 0 && nsp >= 2) {
+            sf_filter_sprockets(sp, nsp, spf, &nspf);
+            if (nspf >= 2 && sf_fit_strip_geometry(spf, nspf, &strip) != 0)
+                strip.pitch = 0.0;
+        }
+
+        if (sf_analyze_band(gray, w, h, y0, y1, PITCH_LO, PITCH_HI, &b) != 0) {
             free(gray);
             bad++;
             continue;
         }
         free(gray);
 
-        pitch[np++] = b.pitch;
+        if (strip.pitch > PITCH_LO && strip.pitch < PITCH_HI)
+            pitch[np++] = strip.pitch;
         if (b.pitch_top > 0.0 && b.pitch_bot > 0.0)
             grad[ng++] = (b.pitch_bot - b.pitch_top) / b.pitch;
         bandh[nb++] = (double) (y1 - y0 + 1);
 
         if (verbose)
             fprintf(stderr, "  geom %-16s band_h=%4d pitch=%7.2f "
-                            "(top %7.2f bot %7.2f) grad=%+.4f\n",
-                    base, y1 - y0 + 1, b.pitch, b.pitch_top, b.pitch_bot,
+                            "grad=%+.4f holes=%d\n",
+                    base, y1 - y0 + 1, strip.pitch,
                     (b.pitch_top > 0.0 && b.pitch_bot > 0.0) ?
-                        (b.pitch_bot - b.pitch_top) / b.pitch : 0.0);
+                        (b.pitch_bot - b.pitch_top) / b.pitch : 0.0,
+                    nspf);
     }
 
     if (np < 1) {
@@ -711,8 +731,10 @@ okargs:
         unsigned char *band_rgb = NULL, *band_gray = NULL;
         int w = 0, h = 0, y0 = 0, y1 = 0, bw = 0, bh = 0;
         int nf = 0, f = 0;
-        double angle = 0.0, grad = 0.0;
-        sf_band b;
+        double grad = 0.0;
+        double pitch = 0.0, phase = 0.0;
+        sf_strip_geometry strip;
+        int n_holes = 0;
         ff_box boxes[SF_MAX_SPROCKETS];
         ff_box lb;
         unsigned char **rgb_crops = NULL, **gray_crops = NULL;
@@ -740,15 +762,11 @@ okargs:
             free(gray);
             continue;
         }
-        /* Strip tilt from the band edges: a flatbed holder only tilts the film
-         * by a degree or so.  Extract band in one go (deskew + rectify) to
-         * avoid rotating the whole 22 MPx image. */
-        angle = sf_band_angle(gray, w, h, y0, y1,
-                              sf_background_level(gray, w, h));
-
+        /* Extract the band with the global position-dependent correction only
+         * (angle = 0): no skew rotation, so the geometry is never shifted. */
         grad = geo.grad;
-        band_rgb = sf_extract_band(rgb, w, h, 3, y0, y1, angle, grad, &bw, &bh);
-        band_gray = sf_extract_band(gray, w, h, 1, y0, y1, angle, grad, &bw, &bh);
+        band_rgb = sf_extract_band(rgb, w, h, 3, y0, y1, 0.0, grad, &bw, &bh);
+        band_gray = sf_extract_band(gray, w, h, 1, y0, y1, 0.0, grad, &bw, &bh);
         free(rgb);
         rgb = NULL;
         free(gray);
@@ -760,44 +778,60 @@ okargs:
             continue;
         }
 
-        /* Phase of the now-uniform lattice, measured on the rectified band. */
-        if (sf_analyze_band(band_gray, bw, bh, 0, bh - 1,
-                            geo.pitch - 60.0, geo.pitch + 60.0, &b) != 0) {
-            fprintf(stderr, "%s: %s: no lattice after rectify\n", argv[0], base);
-            free(band_rgb);
-            free(band_gray);
-            continue;
+        /* Lattice from the sprocket holes on the rectified band: the hole row
+         * is content-independent, so the pitch and phase come from the holes,
+         * not from a band profile or a skew estimate. */
+        {
+            sf_sprocket sp[SF_MAX_SPROCKETS], spf[SF_MAX_SPROCKETS];
+            int nsp = 0, nspf = 0;
+            if (sf_find_sprockets(band_gray, bw, bh, 0, bh - 1, sp, &nsp) < 0 ||
+                nsp < 2) {
+                fprintf(stderr, "%s: %s: no sprocket holes in the band\n",
+                        argv[0], base);
+                free(band_rgb);
+                free(band_gray);
+                continue;
+            }
+            sf_filter_sprockets(sp, nsp, spf, &nspf);
+            if (nspf < 2 || sf_fit_strip_geometry(spf, nspf, &strip) != 0) {
+                fprintf(stderr, "%s: %s: hole row too short in the band\n",
+                        argv[0], base);
+                free(band_rgb);
+                free(band_gray);
+                continue;
+            }
+            pitch = strip.pitch;
+            phase = strip.phase;
+            n_holes = nspf;
         }
 
-        /* Lattice spacing: this scan's own (now uniform) pitch, with the
-         * global model as a sanity fallback. */
-        if (!(b.pitch > PITCH_LO && b.pitch < PITCH_HI))
-            b.pitch = geo.pitch;
+        /* Lattice spacing: this scan's own hole pitch, with the global model
+         * as a sanity fallback. */
+        if (!(pitch > PITCH_LO && pitch < PITCH_HI))
+            pitch = geo.pitch;
 
         if (getenv("SF_DEBUG"))
             fprintf(stderr, "%s band %d..%d rect %dx%d pitch=%.2f "
-                            "top=%.2f bot=%.2f grad=%+.4f phase=%.0f "
-                            "angle=%.4f\n",
-                    base, y0, y1, bw, bh, b.pitch, b.pitch_top, b.pitch_bot,
-                    grad, b.phase, angle);
+                            "grad=%+.4f phase=%.0f holes=%d\n",
+                    base, y0, y1, bw, bh, pitch, grad, phase, n_holes);
 
         if (report)
-            fprintf(stderr, "%-16s angle=%+.4f band=%d..%d pitch=%6.1f "
-                            "phase=%6.0f frames=",
-                    base, angle, y0, y1, b.pitch, b.phase);
+            fprintf(stderr, "%-16s band=%d..%d pitch=%6.1f phase=%6.0f "
+                            "holes=%d frames=",
+                    base, y0, y1, pitch, phase, n_holes);
 
         /* Fixed grid on the rectified band: vertical position from the band
-         * centre, x from the lattice phase. */
+         * centre, x from the hole lattice phase. */
         lb.x0 = 0;
         lb.y0 = 0;
         lb.w = geo.frame_w;
         lb.h = geo.frame_h;
         {
             int ytop = (bh - geo.frame_h) / 2 + geo.offset_y;
-            int imax = (int) (bw / geo.pitch) + 3;
+            int imax = (int) (bw / pitch) + 3;
             int k;
             for (k = -2; k <= imax; k++) {
-                double x = b.phase + (double) k * geo.pitch + geo.offset_x;
+                double x = phase + (double) k * pitch + geo.offset_x;
                 int x0 = (int) floor(x + 0.5);
                 if (x0 + geo.frame_w <= 0)
                     continue;

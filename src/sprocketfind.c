@@ -122,62 +122,6 @@ int sf_background_level(const unsigned char *gray, int w, int h)
     return sf_background(gray, w, h);
 }
 
-double sf_band_angle(const unsigned char *gray, int w, int h,
-                     int band_y0, int band_y1, int bg)
-{
-    int x, lo, hi, span;
-    double sx = 0, sy = 0, sxx = 0, sxy = 0;
-    double t2x = 0, t2y = 0, t2xx = 0, t2xy = 0;
-    int n = 0, n2 = 0;
-
-    if (!gray || w <= 0 || h <= 0 || band_y1 <= band_y0)
-        return 0.0;
-    span = band_y1 - band_y0 + 1;
-    lo = band_y0 - span;
-    if (lo < 0)
-        lo = 0;
-    hi = band_y1 + span;
-    if (hi >= h)
-        hi = h - 1;
-
-    for (x = 0; x < w; x++) {
-        int y, top = -1, bot = -1;
-        for (y = lo; y <= hi; y++)
-            if (abs((int) gray[(size_t) y * w + x] - bg) > SF_BG_TOL) {
-                top = y;
-                break;
-            }
-        for (y = hi; y >= lo; y--)
-            if (abs((int) gray[(size_t) y * w + x] - bg) > SF_BG_TOL) {
-                bot = y;
-                break;
-            }
-        if (top >= 0) {
-            sx += x;
-            sy += top;
-            sxx += (double) x * x;
-            sxy += (double) x * top;
-            n++;
-        }
-        if (bot >= 0) {
-            t2x += x;
-            t2y += bot;
-            t2xx += (double) x * x;
-            t2xy += (double) x * bot;
-            n2++;
-        }
-    }
-    if (n < w / 2 || n2 < w / 2)
-        return 0.0;
-    {
-        double den = n * sxx - sx * sx;
-        double st = den != 0.0 ? (n * sxy - sx * sy) / den : 0.0;
-        double den2 = n2 * t2xx - t2x * t2x;
-        double sb = den2 != 0.0 ? (n2 * t2xy - t2x * t2y) / den2 : 0.0;
-        return atan(0.5 * (st + sb));
-    }
-}
-
 int sf_find_band(const unsigned char *gray, int w, int h,
                  int *out_y0, int *out_y1)
 {
@@ -967,8 +911,6 @@ int sf_build_frames(const sf_strip_geometry *geo, int raster_w, int raster_h,
     return *out_n;
 }
 
-/* -------------------------------------------------------------- deskew */
-
 static double bilinear(const unsigned char *src, int w, int h, double x, double y)
 {
     int x0, y0, x1, y1;
@@ -988,69 +930,6 @@ static double bilinear(const unsigned char *src, int w, int h, double x, double 
     d = src[(size_t) y1 * w + x1];
     return (a * (1 - fx) + b * fx) * (1 - fy) +
            (c * (1 - fx) + d * fx) * fy;
-}
-
-static unsigned char *rotate_ch(const unsigned char *src, int w, int h,
-                                int ch, double angle, int *out_w, int *out_h)
-{
-    double ca = cos(angle), sa = sin(angle);
-    double cx = (w - 1) / 2.0, cy = (h - 1) / 2.0;
-    unsigned char *out;
-    int x, y;
-
-    *out_w = w;
-    *out_h = h;
-    out = calloc((size_t) w * h * ch, sizeof(unsigned char));
-    if (!out)
-        return NULL;
-
-    for (y = 0; y < h; y++) {
-        for (x = 0; x < w; x++) {
-            double dx = x - cx, dy = y - cy;
-            double sx = cx + ca * dx - sa * dy;
-            double sy = cy + sa * dx + ca * dy;
-
-            if (ch == 1) {
-                out[(size_t) y * w + x] =
-                    (unsigned char) (bilinear(src, w, h, sx, sy) + 0.5);
-            } else {
-                int c;
-                if (sx < 0.0 || sy < 0.0 ||
-                    sx > (double) (w - 1) || sy > (double) (h - 1)) {
-                    for (c = 0; c < ch; c++)
-                        out[((size_t) y * w + x) * ch + c] = 0;
-                    continue;
-                }
-                for (c = 0; c < ch; c++) {
-                    int x0 = (int) sx, y0 = (int) sy;
-                    int x1 = x0 + 1 < w ? x0 + 1 : x0;
-                    int y1 = y0 + 1 < h ? y0 + 1 : y0;
-                    double fx = sx - x0, fy = sy - y0;
-                    double a = src[((size_t) y0 * w + x0) * ch + c];
-                    double b = src[((size_t) y0 * w + x1) * ch + c];
-                    double d = src[((size_t) y1 * w + x0) * ch + c];
-                    double e = src[((size_t) y1 * w + x1) * ch + c];
-                    double v = (a * (1 - fx) + b * fx) * (1 - fy) +
-                               (d * (1 - fx) + e * fx) * fy;
-                    out[((size_t) y * w + x) * ch + c] =
-                        (unsigned char) (v + 0.5);
-                }
-            }
-        }
-    }
-    return out;
-}
-
-unsigned char *sf_deskew_gray(const unsigned char *gray, int w, int h,
-                              double angle, int *out_w, int *out_h)
-{
-    return rotate_ch(gray, w, h, 1, angle, out_w, out_h);
-}
-
-unsigned char *sf_deskew_rgb(const unsigned char *rgb, int w, int h,
-                             double angle, int *out_w, int *out_h)
-{
-    return rotate_ch(rgb, w, h, 3, angle, out_w, out_h);
 }
 
 /* -------------------------------------------------------------- frame sprockets */

@@ -6,11 +6,11 @@
  * An 8mm scan shows the film as a horizontal band with the picture frames
  * running along it.  The sprocket holes sit in the rebate along one edge
  * (Super 8) or both edges (Regular 8 / Double 8); they are the one reference
- * that does not depend on picture content, so they carry both the strip skew
- * and the frame pitch.
+ * that does not depend on picture content, so they carry the frame pitch and
+ * the strip angle.
  *
  * The detected strip geometry includes:
- *   - angle: radians, film strip angle vs horizontal (for deskew)
+ *   - angle: radians, film strip angle vs horizontal (fitted to the hole row)
  *   - pitch: along-strip spacing between sprockets (px) = frame advance
  *   - cx, cy: centroid of the sprocket row
  *   - film_w: thickness of the film band across the strip (px)
@@ -73,12 +73,6 @@ int sf_find_band(const unsigned char *gray, int w, int h,
 /* Modal scanner background level (the value just outside the film band). */
 int sf_background_level(const unsigned char *gray, int w, int h);
 
-/* Strip tilt in radians, fitted from the top and bottom edges of the band as
- * functions of x.  Robust for the small (0..2 deg) tilts a flatbed film
- * holder produces, where fitting the perforation row is noisy. */
-double sf_band_angle(const unsigned char *gray, int w, int h,
-                     int band_y0, int band_y1, int bg);
-
 /* Detects sprocket holes inside the band [band_y0, band_y1].  Both dark and
  * bright polarities are tried and the one forming the most regular row is
  * kept.  Writes up to SF_MAX_SPROCKETS centres, sorted along the strip.
@@ -140,15 +134,6 @@ void sf_print_geometry(const sf_strip_geometry *g);
 int sf_build_frames(const sf_strip_geometry *geo, int raster_w, int raster_h,
                     int frame_w, int frame_h, int offset_x, int offset_y,
                     int include_partial, ff_box *out, int *out_n);
-
-/* -------------------------------------------------------------- skew */
-
-/* Rotate a grayscale / packed-RGB raster by -angle about its centre, bilinear.
- * Output has the same dimensions.  Caller frees. */
-unsigned char *sf_deskew_gray(const unsigned char *gray, int w, int h,
-                              double angle, int *out_w, int *out_h);
-unsigned char *sf_deskew_rgb(const unsigned char *rgb, int w, int h,
-                             double angle, int *out_w, int *out_h);
 
 /* -------------------------------------------------------------- stab */
 
