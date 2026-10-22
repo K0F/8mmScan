@@ -49,7 +49,8 @@ DUPS=$(grep -c ',dup_of_' "$TMP/out2/manifest.csv" || true)
 [ "$DUPS" = "$N1" ] || fail "expected $N1 dup rows, got $DUPS"
 NPNG=$(ls "$TMP/out2"/render/frame_*.png | wc -l | tr -d ' ')
 LAST=$(ls "$TMP/out2"/render/frame_*.png | sed -n 's/.*frame_\([0-9]*\)\.png$/\1/p' | sort -n | tail -1)
-[ "$NPNG" = "$((10#$LAST + 1))" ] \
+LAST_EXP=$(expr "$LAST" + 1)
+[ "$NPNG" = "$LAST_EXP" ] \
   || fail "frame numbering has a hole: $NPNG files but the highest is $LAST"
 echo "    ok duplicates dropped, numbering dense"
 
